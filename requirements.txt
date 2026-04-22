@@ -1,0 +1,13 @@
+# Core
+telethon==1.36.0
+motor==3.4.0
+pymongo==4.7.2
+
+# Fuzzy search
+rapidfuzz==3.9.3
+
+# Config
+python-dotenv==1.0.1
+
+# Optional: faster event loop (recommended for production)
+uvloop==0.19.0; sys_platform != "win32"
