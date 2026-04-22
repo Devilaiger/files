@@ -21,6 +21,18 @@ Commands from PM (env ADMIN_IDS only):
   /set_trigger <group_id> <text>      – direct for specific group
   /trigger_list <group_id>            – list triggers for specific group
   /delete <group_id> <index>          – delete trigger
+
+WIZARD ISOLATION
+----------------
+  Every wizard session stores the chat_id where it was started
+  (initiated_chat_id).  The state handler IGNORES any message that
+  arrives from a different chat — even from the same sender.
+
+  This means:
+    • Admin starts /set_trigger in Group A.
+    • Admin forwards an image to Group B, sends a message in PM, etc.
+    → ALL of those are silently ignored; wizard stays open in Group A.
+    • Only a message sent INSIDE GROUP A advances the wizard.
 """
 from __future__ import annotations
 
@@ -65,26 +77,10 @@ async def resolve_storage_peer(client) -> bool:
         return False
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-async def _refresh_group_cache(group_id: int) -> None:
-    await cache.invalidate_group(group_id, db.fetch_triggers_for_group)
-
-
-def _nav_buttons(page: int, total_pages: int) -> list | None:
-    if total_pages <= 1:
-        return None
-    row = []
-    if page > 0:
-        row.append(Button.inline("Prev", f"tpage:{page - 1}".encode()))
-    row.append(Button.inline(f"{page + 1}/{total_pages}", b"tpage:noop"))
-    if page < total_pages - 1:
-        row.append(Button.inline("Next", f"tpage:{page + 1}".encode()))
-    return [row]
-
+# ── Media helpers ──────────────────────────────────────────────────────────────
 
 def _is_sticker(media) -> bool:
-    """Return True if the media is a Telegram sticker (can't have a caption)."""
+    """Return True if the media is a Telegram sticker (captions not allowed)."""
     if not isinstance(media, MessageMediaDocument):
         return False
     if not getattr(media, "document", None):
@@ -95,19 +91,24 @@ def _is_sticker(media) -> bool:
     )
 
 
-async def _store_media_in_storage(client, source_chat_id: int, source_msg_id: int,
-                                   media, meta_caption: str) -> int | None:
+async def _store_media_in_storage(
+    client,
+    source_chat_id: int,
+    source_msg_id: int,
+    media,
+    meta_caption: str,
+) -> int | None:
     """
     Copy media to the storage channel WITHOUT a 'Forwarded from' header.
 
     Strategy (each step is a fallback):
       1. send_file with metadata caption   — clean, labelled entry
-      2. send_file without caption          — for types that reject captions (stickers)
-      3. forward_messages                   — last resort
+      2. send_file without caption          — stickers can't carry captions
+      3. forward_messages                   — absolute last resort
 
     Returns the storage message ID on success, or None on total failure.
     """
-    # Stickers cannot carry a caption via the API; skip straight to step 2.
+    # Stickers cannot carry a caption via the API — skip to step 2.
     if _is_sticker(media):
         try:
             sent = await client.send_file(_storage_peer, media, silent=True)
@@ -151,9 +152,35 @@ async def _store_media_in_storage(client, source_chat_id: int, source_msg_id: in
         return None
 
 
+# ── Cache helper ───────────────────────────────────────────────────────────────
+
+async def _refresh_group_cache(group_id: int) -> None:
+    await cache.invalidate_group(group_id, db.fetch_triggers_for_group)
+
+
+# ── Pagination ─────────────────────────────────────────────────────────────────
+
+def _nav_buttons(page: int, total_pages: int) -> list | None:
+    if total_pages <= 1:
+        return None
+    row = []
+    if page > 0:
+        row.append(Button.inline("Prev", f"tpage:{page - 1}".encode()))
+    row.append(Button.inline(f"{page + 1}/{total_pages}", b"tpage:noop"))
+    if page < total_pages - 1:
+        row.append(Button.inline("Next", f"tpage:{page + 1}".encode()))
+    return [row]
+
+
 # ── Permission helpers ─────────────────────────────────────────────────────────
 
 async def _resolve_group_id(event) -> tuple:
+    """
+    Determine which group_id a trigger command targets.
+    Inside a group  -> group_id = event.chat_id (always; user args ignored).
+    From PM         -> only env ADMIN_IDS; group_id must be first arg.
+    Returns (group_id, error_message). error_message is None on success.
+    """
     if not event.is_private:
         return event.chat_id, None
 
@@ -175,6 +202,11 @@ async def _resolve_group_id(event) -> tuple:
 
 
 async def _require_trigger_permission(event, group_id: int) -> bool:
+    """
+    env ADMIN_IDS        -> always allowed (any group)
+    Telegram group admin -> allowed only for their own group, from inside it
+    Normal user          -> denied
+    """
     sender_id = event.sender_id
     if sender_id in config.ADMIN_IDS:
         return True
@@ -217,6 +249,7 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
 
     sender_id = event.sender_id
 
+    # Strip "/set_trigger" and (if PM) the group_id token to get the actual arg
     raw_parts = event.text.strip().split(maxsplit=1)
     arg_portion = raw_parts[1] if len(raw_parts) > 1 else ""
     if event.is_private and arg_portion:
@@ -226,6 +259,9 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
     has_arg = bool(arg_portion)
     has_reply = event.is_reply and not event.is_private
 
+    # The ONLY chat where wizard replies will be accepted
+    initiated_chat_id = event.chat_id
+
     # Method 3: reply to existing message (in-group only)
     if has_reply and not has_arg:
         replied = await event.get_reply_message()
@@ -233,32 +269,55 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
             await event.reply("The replied-to message has no text to use as trigger.")
             raise StopPropagation
         trigger_text = normalize_trigger(replied.text.split()[0])
-        state.set(sender_id, state.AWAIT_TRIGGER_MSG, trigger_text=trigger_text, group_id=group_id)
+        state.set(
+            sender_id,
+            state.AWAIT_TRIGGER_MSG,
+            trigger_text=trigger_text,
+            group_id=group_id,
+            initiated_chat_id=initiated_chat_id,
+        )
         await event.reply(
-            f"Trigger: `{trigger_text}`\n\n"
-            "Now **send the message** to attach — text, image, video, document, sticker, or forward any message.",
+            f"🔑 Keyword locked: `{trigger_text}`\n\n"
+            "**Step 2/2 — Send the message to attach:**\n"
+            "image, video, sticker, document, audio, text, or forward any message.\n\n"
+            "⚠️ Send it **in this chat only** — messages from other chats are ignored.",
             parse_mode="md",
         )
         raise StopPropagation
 
-    # Method 2: text provided inline
+    # Method 2: trigger text provided inline
     if has_arg:
         trigger_text = normalize_trigger(arg_portion)
         if not trigger_text:
             await event.reply("Trigger text is empty after normalisation.")
             raise StopPropagation
-        state.set(sender_id, state.AWAIT_TRIGGER_MSG, trigger_text=trigger_text, group_id=group_id)
+        state.set(
+            sender_id,
+            state.AWAIT_TRIGGER_MSG,
+            trigger_text=trigger_text,
+            group_id=group_id,
+            initiated_chat_id=initiated_chat_id,
+        )
         await event.reply(
-            f"Trigger: `{trigger_text}`\n\n"
-            "Now **send the message** to attach — text, image, video, document, sticker, or forward any message.",
+            f"🔑 Keyword locked: `{trigger_text}`\n\n"
+            "**Step 2/2 — Send the message to attach:**\n"
+            "image, video, sticker, document, audio, text, or forward any message.\n\n"
+            "⚠️ Send it **in this chat only** — messages from other chats are ignored.",
             parse_mode="md",
         )
         raise StopPropagation
 
-    # Method 1: interactive wizard
-    state.set(sender_id, state.AWAIT_TRIGGER_TEXT, group_id=group_id)
+    # Method 1: interactive wizard — ask for the keyword first
+    state.set(
+        sender_id,
+        state.AWAIT_TRIGGER_TEXT,
+        group_id=group_id,
+        initiated_chat_id=initiated_chat_id,
+    )
     await event.reply(
-        f"Send the trigger text (keyword to watch for).\nGroup: `{group_id}`",
+        f"**Step 1/2 — Type the trigger keyword** (text only, e.g. `chainsaw man`).\n"
+        f"Group: `{group_id}`\n\n"
+        "⚠️ Respond **in this chat only** — other chats are ignored.",
         parse_mode="md",
     )
     raise StopPropagation
@@ -312,19 +371,30 @@ async def cmd_delete_trigger(event: events.NewMessage.Event) -> None:
     success, deleted_text = await db.delete_trigger_at_index(group_id, index)
     if success:
         await _refresh_group_cache(group_id)
-        await event.reply(f"Deleted trigger #{index}: {deleted_text}")
+        await event.reply(f"✅ Deleted trigger #{index}: `{deleted_text}`", parse_mode="md")
     else:
         total = len(await db.fetch_triggers_for_group(group_id))
         await event.reply(
-            f"Invalid index {index}. Valid range: 1-{total}.\nUse /trigger_list to see the list."
+            f"Invalid index {index}. Valid range: 1–{total}.\nUse /trigger_list to see the list."
         )
     raise StopPropagation
 
 
 async def cmd_cancel(event: events.NewMessage.Event) -> None:
-    if state.has(event.sender_id):
-        state.clear(event.sender_id)
-        await event.reply("Cancelled.")
+    sender_id = event.sender_id
+    if state.has(sender_id):
+        current = state.get(sender_id)
+        initiated = current.data.get("initiated_chat_id") if current else None
+        # Allow cancel from the wizard chat OR from PM (unstuck safety valve)
+        if initiated is not None and event.chat_id != initiated and not event.is_private:
+            await event.reply(
+                "No active wizard in this chat.\n"
+                f"Your open wizard is in chat `{initiated}` — send /cancel there.",
+                parse_mode="md",
+            )
+            raise StopPropagation
+        state.clear(sender_id)
+        await event.reply("✅ Wizard cancelled.")
     else:
         await event.reply("Nothing to cancel.")
     raise StopPropagation
@@ -337,7 +407,6 @@ async def cb_trigger_page(event: events.CallbackQuery.Event) -> None:
     if data == "tpage:noop":
         await event.answer()
         return
-
     try:
         page = int(data.split(":")[1])
     except (IndexError, ValueError):
@@ -354,21 +423,50 @@ async def cb_trigger_page(event: events.CallbackQuery.Event) -> None:
     await event.answer()
 
 
-# ── In-flight guard ───────────────────────────────────────────────────────────
-_in_flight: set[tuple[int, int]] = set()
+# ── In-flight guard (prevents double-processing the same message) ─────────────
+_in_flight: set[tuple[int, int]] = set()  # (sender_id, message_id)
 
 
 # ==============================================================================
-#  STATE REPLY HANDLER
+#  STATE REPLY HANDLER  — called from main.py general_dispatcher
 # ==============================================================================
 
 async def handle_state_reply(event: events.NewMessage.Event) -> bool:
+    """
+    Process a message that is part of an ongoing setup wizard.
+
+    CRITICAL ISOLATION RULE
+    -----------------------
+    We compare event.chat_id against state.data["initiated_chat_id"].
+    If they don't match the message is from a DIFFERENT CHAT and must be
+    ignored completely (return False) so the dispatcher continues normally.
+
+    Example of the bug this prevents:
+      1. Admin runs /set_trigger in Group A  → state stored with initiated_chat_id=A
+      2. Admin forwards a photo to Group B
+      3. main.py fires handle_state_reply for that Group B event
+         → chat_id=B ≠ initiated_chat_id=A → returns False immediately  ✓
+         → message proceeds through normal dispatch (trigger match, etc.)
+
+    Double-processing guard:
+      (sender_id, message_id) is tracked in _in_flight.
+    """
     sender_id = event.sender_id
     msg_id = event.id
     flight_key = (sender_id, msg_id)
 
     current = state.get(sender_id)
     if not current:
+        return False
+
+    # ── CHAT ISOLATION CHECK ─────────────────────────────────────────────────
+    initiated_chat_id = current.data.get("initiated_chat_id")
+    if initiated_chat_id is not None and event.chat_id != initiated_chat_id:
+        # Different chat — do NOT consume this message. Let it flow normally.
+        logger.debug(
+            "Wizard isolation: ignoring msg from chat %s (wizard locked to chat %s) for user %s",
+            event.chat_id, initiated_chat_id, sender_id,
+        )
         return False
 
     if flight_key in _in_flight:
@@ -382,22 +480,35 @@ async def handle_state_reply(event: events.NewMessage.Event) -> bool:
 
 
 async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
-    # ── Step 1: waiting for trigger text ─────────────────────────────────────
+    # ── Step 1: waiting for trigger keyword (interactive wizard) ──────────────
     if current.step == state.AWAIT_TRIGGER_TEXT:
+        # Step 1 only accepts plain text — reject media with a helpful message
+        if event.message.media and not isinstance(event.message.media, MessageMediaWebPage):
+            await event.reply(
+                "⚠️ **Step 1 needs a text keyword**, not a file.\n\n"
+                "Type the trigger word/phrase (e.g. `chainsaw man`).\n"
+                "You'll send the image/video/sticker in the next step.",
+                parse_mode="md",
+            )
+            return True  # consumed — do NOT fall through to trigger matching
+
         trigger_text = normalize_trigger(event.text or "")
         if not trigger_text:
-            await event.reply("❌ Please send a non-empty trigger text.")
+            await event.reply("❌ Please send a non-empty text keyword.")
             return True
+
         state.set(
             sender_id,
             state.AWAIT_TRIGGER_MSG,
             trigger_text=trigger_text,
             group_id=current.data.get("group_id"),
+            initiated_chat_id=current.data.get("initiated_chat_id"),
         )
         await event.reply(
-            f"📌 Trigger: `{trigger_text}`\n\n"
-            "Now **send the message** to attach — text, image, video, document, "
-            "sticker, or forward any message.",
+            f"✅ Keyword: `{trigger_text}`\n\n"
+            "**Step 2/2 — Send the message to attach:**\n"
+            "image, video, sticker, document, audio, text, or forward any message.\n\n"
+            "⚠️ Send it **in this chat only**.",
             parse_mode="md",
         )
         return True
@@ -410,19 +521,19 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
         if not trigger_text or not group_id:
             state.clear(sender_id)
             await event.reply(
-                "❌ Internal error: state data lost. "
+                "❌ Internal error: wizard state lost. "
                 "Start over with /set_trigger inside the search group."
             )
             return True
 
-        msg = await event.client.get_messages(event.chat_id, ids=event.id)
-        if msg is None:
-            await event.reply("❌ Could not read your message. Try again.")
-            return True
+        # ── Use event.message directly — do NOT re-fetch with get_messages().
+        #    Re-fetching can return None for freshly sent messages (race condition)
+        #    and also fails silently for media messages in some chat contexts.
+        msg = event.message
 
         content_text = msg.text or msg.message or ""
 
-        # TEXT / LINK: no media, OR only a web-page preview, AND has actual text
+        # TEXT / LINK: no media at all, OR only a web-preview, AND has text
         is_text_or_link = (
             not msg.media
             or isinstance(msg.media, MessageMediaWebPage)
@@ -442,13 +553,22 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             await event.reply(
                 f"✅ Trigger saved!\n\n"
                 f"🔑 Keyword: `{trigger_text}`\n"
-                f"📜 Type: text/link — stored directly in DB\n\n"
-                "You can delete this message from the group — the trigger still works.",
+                f"📜 Type: text/link — stored in DB\n\n"
+                "You can delete this message — the trigger still works.",
                 parse_mode="md",
             )
             return True
 
         # ── MEDIA path (photo, video, document, audio, voice, sticker…) ─────
+        # Images/videos/stickers with NO caption are perfectly valid here.
+        if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+            # Nothing usable — blank message somehow
+            await event.reply(
+                "❌ Could not detect any content in that message.\n"
+                "Please send an image, video, sticker, document, or a text message."
+            )
+            return True
+
         if _storage_peer is None:
             state.clear(sender_id)
             await event.reply(
@@ -458,15 +578,14 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             )
             return True
 
-        # Build metadata caption (written into the storage message so the
-        # storage channel stays self-documenting)
+        # Metadata caption stored alongside the file in the storage channel
         meta_caption = (
             f"#trigger | {trigger_text} | group: {group_id}\n"
             + (content_text or "")
         ).strip()
 
-        # Store using send_file (clean copy — no "Forwarded from" header).
-        # Falls back through multiple strategies; stickers handled specially.
+        # Store cleanly via send_file (no "Forwarded from" header).
+        # Stickers and fallback cases handled inside _store_media_in_storage.
         storage_msg_id = await _store_media_in_storage(
             event.client, event.chat_id, event.id, msg.media, meta_caption
         )
@@ -495,7 +614,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             f"✅ Trigger saved!\n\n"
             f"🔑 Keyword: `{trigger_text}`\n"
             f"📦 Type: {media_type} — stored in storage channel (msg `{storage_msg_id}`)\n\n"
-            "You can delete this message from the group — the trigger still works.",
+            "You can delete this message — the trigger still works.",
             parse_mode="md",
         )
         return True
@@ -508,6 +627,10 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
 # ==============================================================================
 
 async def handle_trigger_match(event: events.NewMessage.Event) -> bool:
+    """
+    Check if any trigger for THIS group matches the incoming message.
+    Longest match wins. Returns True if a trigger was fired.
+    """
     text = event.text or event.caption or ""
     if not text:
         return False
@@ -528,7 +651,10 @@ async def handle_trigger_match(event: events.NewMessage.Event) -> bool:
     if stype == "text":
         stored_text = matched.get("storage_text", "")
         if not stored_text:
-            logger.warning("Trigger '%s' has storage_type=text but no storage_text", matched["trigger"])
+            logger.warning(
+                "Trigger '%s' has storage_type=text but no storage_text",
+                matched["trigger"],
+            )
             return True
         try:
             await event.client.send_message(
@@ -559,7 +685,7 @@ async def handle_trigger_match(event: events.NewMessage.Event) -> bool:
             )
             return True
 
-        # Strip the metadata line we wrote at storage time
+        # Strip the metadata line written at storage time
         caption = stored_msg.text or stored_msg.message or ""
         if caption.startswith("#trigger |"):
             lines = caption.split("\n", 2)
