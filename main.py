@@ -15,7 +15,8 @@ import sys
 
 from telethon import TelegramClient, events
 from telethon.events import StopPropagation
-
+from keep_alive import start_server
+import os
 import cache
 import config
 import db
@@ -171,4 +172,5 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 if __name__ == "__main__":
+    start_server(port=int(os.environ.get("PORT", 10000)))
     asyncio.run(main())
