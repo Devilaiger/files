@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 _SHOW_PREFIX = "show:"
 
 
+def _message_text(message: Message) -> str:
+    return getattr(message, "text", None) or getattr(message, "message", None) or ""
+
+
 # ── Permission helpers ────────────────────────────────────────────────────────
 
 async def _is_admin_in_chat(client: TelegramClient, chat_id: int, user_id: int) -> bool:
@@ -623,7 +627,7 @@ async def _index_channel(client: TelegramClient, channel_id: int, status_msg=Non
     count = 0
     try:
         async for msg in client.iter_messages(channel_id, limit=config.INDEX_LIMIT):
-            text = msg.text or msg.caption or ""
+            text = _message_text(msg)
             if not text:
                 continue
             normalized = normalize_text(text)
@@ -650,7 +654,7 @@ async def _index_channel(client: TelegramClient, channel_id: int, status_msg=Non
 
 async def auto_index_new_post(message: Message, channel_id: int) -> None:
     """Auto-index new posts from main channels as they arrive."""
-    text = message.text or message.caption or ""
+    text = _message_text(message)
     if not text:
         return
     normalized = normalize_text(text)

@@ -41,6 +41,11 @@ logger = logging.getLogger("bot.main")
 client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
 
 
+def _event_text(event: events.NewMessage.Event) -> str:
+    msg = getattr(event, "message", None)
+    return getattr(event, "text", None) or getattr(msg, "message", None) or ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  GENERAL DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,7 +56,7 @@ async def general_dispatcher(event: events.NewMessage.Event) -> None:
     Route every non-command incoming message through the priority chain.
     Commands (/...) are handled by dedicated pattern-matched handlers.
     """
-    text = event.text or event.caption or ""
+    text = _event_text(event)
 
     # Skip commands — handled by pattern handlers with StopPropagation
     if text.startswith("/"):
@@ -61,7 +66,7 @@ async def general_dispatcher(event: events.NewMessage.Event) -> None:
 
     # ── Priority 1: active setup wizard (admin state machine) ─────────────────
     # Works in any chat — wizard follow-up can arrive from anywhere.
-    if state.has(sender_id):
+    if state.has(state.key(sender_id, event.chat_id)) or state.has(sender_id):
         consumed = await handle_state_reply(event)
         if consumed:
             return
@@ -151,6 +156,8 @@ async def startup() -> None:
             "Storage channel could not be resolved. "
             "Media triggers will fail until this is fixed and bot is restarted."
         )
+    else:
+        await triggers.migrate_storage_to_hidden(client)
 
     triggers.register(client)
     search.register(client)

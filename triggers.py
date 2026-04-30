@@ -36,7 +36,9 @@ WIZARD ISOLATION
 """
 from __future__ import annotations
 
+import base64
 import logging
+import pickle
 
 from telethon import TelegramClient, events
 from telethon.events import StopPropagation
@@ -91,13 +93,47 @@ def _is_sticker(media) -> bool:
     )
 
 
+def _message_content_text(msg) -> str:
+    return (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
+
+
+def _has_real_media(msg) -> bool:
+    media = getattr(msg, "media", None)
+    return bool(media) and not isinstance(media, MessageMediaWebPage)
+
+
+def _serialize_media(media) -> str | None:
+    if not media:
+        return None
+    return base64.b64encode(pickle.dumps(media)).decode("ascii")
+
+
+def _deserialize_media(media_b64: str | None):
+    if not media_b64:
+        return None
+    try:
+        return pickle.loads(base64.b64decode(media_b64.encode("ascii")))
+    except Exception as e:
+        logger.warning("Stored media reference could not be decoded: %s", e)
+        return None
+
+
+async def _delete_storage_message(client, msg_id: int) -> None:
+    if not config.STORAGE_DELETE_AFTER_SAVE:
+        return
+    try:
+        await client.delete_messages(_storage_peer, msg_id, revoke=True)
+    except Exception as e:
+        logger.warning("Could not delete storage-channel message %s: %s", msg_id, e)
+
+
 async def _store_media_in_storage(
     client,
     source_chat_id: int,
     source_msg_id: int,
     media,
-    meta_caption: str,
-) -> int | None:
+    meta_caption: str | None,
+):
     """
     Copy media to the storage channel WITHOUT a 'Forwarded from' header.
 
@@ -106,47 +142,42 @@ async def _store_media_in_storage(
       2. send_file without caption          — stickers can't carry captions
       3. forward_messages                   — absolute last resort
 
-    Returns the storage message ID on success, or None on total failure.
+    Returns the stored Message on success, or None on total failure.
     """
     # Stickers cannot carry a caption via the API — skip to step 2.
     if _is_sticker(media):
         try:
-            sent = await client.send_file(_storage_peer, media, silent=True)
-            return sent.id
+            return await client.send_file(_storage_peer, media, silent=True)
         except Exception as e:
             logger.warning("send_file (no caption) failed for sticker: %s — trying forward", e)
             try:
                 fwd = await client.forward_messages(_storage_peer, source_msg_id, source_chat_id)
-                stored = fwd[0] if isinstance(fwd, list) else fwd
-                return stored.id
+                return fwd[0] if isinstance(fwd, list) else fwd
             except Exception as fe:
                 logger.error("All storage methods failed for sticker: %s", fe)
                 return None
 
     # Step 1: send_file WITH caption (photos, videos, documents, audio, voice…)
     try:
-        sent = await client.send_file(
+        return await client.send_file(
             _storage_peer, media,
             caption=meta_caption,
             parse_mode=None,
             silent=True,
         )
-        return sent.id
     except Exception as e:
         logger.warning("send_file with caption failed: %s — retrying without caption", e)
 
     # Step 2: send_file WITHOUT caption
     try:
-        sent = await client.send_file(_storage_peer, media, silent=True)
-        return sent.id
+        return await client.send_file(_storage_peer, media, silent=True)
     except Exception as e:
         logger.warning("send_file without caption failed: %s — falling back to forward", e)
 
     # Step 3: forward_messages (last resort — will show "Forwarded from" header)
     try:
         fwd = await client.forward_messages(_storage_peer, source_msg_id, source_chat_id)
-        stored = fwd[0] if isinstance(fwd, list) else fwd
-        return stored.id
+        return fwd[0] if isinstance(fwd, list) else fwd
     except Exception as e:
         logger.error("All storage methods failed: %s", e)
         return None
@@ -156,6 +187,48 @@ async def _store_media_in_storage(
 
 async def _refresh_group_cache(group_id: int) -> None:
     await cache.invalidate_group(group_id, db.fetch_triggers_for_group)
+
+
+async def migrate_storage_to_hidden(client) -> None:
+    if not config.STORAGE_DELETE_AFTER_SAVE:
+        return
+
+    migrated = 0
+    for doc in await db.fetch_all_triggers():
+        if doc.get("storage_type") != "media" or doc.get("storage_media_b64"):
+            continue
+
+        chat_id = doc.get("storage_chat_id")
+        msg_id = doc.get("storage_message_id")
+        if not chat_id or not msg_id:
+            continue
+
+        try:
+            stored_msg = await client.get_messages(chat_id, ids=msg_id)
+            if not stored_msg or not stored_msg.media:
+                continue
+
+            caption = _message_content_text(stored_msg)
+            if caption.startswith("#trigger |"):
+                lines = caption.split("\n", 2)
+                caption = lines[-1].strip() if len(lines) > 1 else ""
+
+            media_ref = _serialize_media(stored_msg.media)
+            if not media_ref:
+                continue
+
+            await db.update_trigger_hidden_media(doc["_id"], caption or None, media_ref)
+            await _delete_storage_message(client, msg_id)
+            await _refresh_group_cache(doc["group_id"])
+            migrated += 1
+        except Exception as e:
+            logger.warning(
+                "Could not migrate storage message %s/%s for trigger '%s': %s",
+                chat_id, msg_id, doc.get("trigger"), e,
+            )
+
+    if migrated:
+        logger.info("Migrated %d visible storage message(s) to hidden storage.", migrated)
 
 
 # ── Pagination ─────────────────────────────────────────────────────────────────
@@ -261,6 +334,7 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
 
     # The ONLY chat where wizard replies will be accepted
     initiated_chat_id = event.chat_id
+    session_key = state.key(sender_id, initiated_chat_id)
 
     # Method 3: reply to existing message (in-group only)
     if has_reply and not has_arg:
@@ -270,7 +344,7 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
             raise StopPropagation
         trigger_text = normalize_trigger(replied.text.split()[0])
         state.set(
-            sender_id,
+            session_key,
             state.AWAIT_TRIGGER_MSG,
             trigger_text=trigger_text,
             group_id=group_id,
@@ -292,7 +366,7 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
             await event.reply("Trigger text is empty after normalisation.")
             raise StopPropagation
         state.set(
-            sender_id,
+            session_key,
             state.AWAIT_TRIGGER_MSG,
             trigger_text=trigger_text,
             group_id=group_id,
@@ -309,7 +383,7 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
 
     # Method 1: interactive wizard — ask for the keyword first
     state.set(
-        sender_id,
+        session_key,
         state.AWAIT_TRIGGER_TEXT,
         group_id=group_id,
         initiated_chat_id=initiated_chat_id,
@@ -382,8 +456,13 @@ async def cmd_delete_trigger(event: events.NewMessage.Event) -> None:
 
 async def cmd_cancel(event: events.NewMessage.Event) -> None:
     sender_id = event.sender_id
-    if state.has(sender_id):
-        current = state.get(sender_id)
+    session_key = state.key(sender_id, event.chat_id)
+    current_key = session_key
+    current = state.get(session_key)
+    if not current:
+        current_key, current = state.find_for_user(sender_id)
+
+    if current:
         initiated = current.data.get("initiated_chat_id") if current else None
         # Allow cancel from the wizard chat OR from PM (unstuck safety valve)
         if initiated is not None and event.chat_id != initiated and not event.is_private:
@@ -393,7 +472,10 @@ async def cmd_cancel(event: events.NewMessage.Event) -> None:
                 parse_mode="md",
             )
             raise StopPropagation
-        state.clear(sender_id)
+        if event.is_private:
+            state.clear_for_user(sender_id)
+        else:
+            state.clear(current_key)
         await event.reply("✅ Wizard cancelled.")
     else:
         await event.reply("Nothing to cancel.")
@@ -455,7 +537,8 @@ async def handle_state_reply(event: events.NewMessage.Event) -> bool:
     msg_id = event.id
     flight_key = (sender_id, msg_id)
 
-    current = state.get(sender_id)
+    session_key = state.key(sender_id, event.chat_id)
+    current = state.get(session_key) or state.get(sender_id)
     if not current:
         return False
 
@@ -474,12 +557,12 @@ async def handle_state_reply(event: events.NewMessage.Event) -> bool:
     _in_flight.add(flight_key)
 
     try:
-        return await _handle_state_reply_inner(event, sender_id, current)
+        return await _handle_state_reply_inner(event, session_key, sender_id, current)
     finally:
         _in_flight.discard(flight_key)
 
 
-async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
+async def _handle_state_reply_inner(event, session_key, sender_id: int, current) -> bool:
     # ── Step 1: waiting for trigger keyword (interactive wizard) ──────────────
     if current.step == state.AWAIT_TRIGGER_TEXT:
         # Step 1 only accepts plain text — reject media with a helpful message
@@ -498,7 +581,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             return True
 
         state.set(
-            sender_id,
+            session_key,
             state.AWAIT_TRIGGER_MSG,
             trigger_text=trigger_text,
             group_id=current.data.get("group_id"),
@@ -519,7 +602,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
         group_id = current.data.get("group_id")
 
         if not trigger_text or not group_id:
-            state.clear(sender_id)
+            state.clear(session_key)
             await event.reply(
                 "❌ Internal error: wizard state lost. "
                 "Start over with /set_trigger inside the search group."
@@ -531,7 +614,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
         #    and also fails silently for media messages in some chat contexts.
         msg = event.message
 
-        content_text = msg.text or msg.message or ""
+        content_text = _message_content_text(msg)
 
         # TEXT / LINK: no media at all, OR only a web-preview, AND has text
         is_text_or_link = (
@@ -549,7 +632,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
                 storage_message_id=None,
             )
             await _refresh_group_cache(group_id)
-            state.clear(sender_id)
+            state.clear(session_key)
             await event.reply(
                 f"✅ Trigger saved!\n\n"
                 f"🔑 Keyword: `{trigger_text}`\n"
@@ -561,7 +644,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
 
         # ── MEDIA path (photo, video, document, audio, voice, sticker…) ─────
         # Images/videos/stickers with NO caption are perfectly valid here.
-        if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+        if not _has_real_media(msg):
             # Nothing usable — blank message somehow
             await event.reply(
                 "❌ Could not detect any content in that message.\n"
@@ -570,7 +653,7 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             return True
 
         if _storage_peer is None:
-            state.clear(sender_id)
+            state.clear(session_key)
             await event.reply(
                 "❌ Storage channel not resolved at startup.\n"
                 "Restart the bot and confirm STORAGE_CHANNEL_ID is correct "
@@ -578,20 +661,17 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             )
             return True
 
-        # Metadata caption stored alongside the file in the storage channel
-        meta_caption = (
-            f"#trigger | {trigger_text} | group: {group_id}\n"
-            + (content_text or "")
-        ).strip()
+        # Keep storage channel posts clean: only preserve the original caption.
+        storage_caption = content_text or None
 
         # Store cleanly via send_file (no "Forwarded from" header).
         # Stickers and fallback cases handled inside _store_media_in_storage.
-        storage_msg_id = await _store_media_in_storage(
-            event.client, event.chat_id, event.id, msg.media, meta_caption
+        stored_msg = await _store_media_in_storage(
+            event.client, event.chat_id, event.id, msg.media, storage_caption
         )
 
-        if storage_msg_id is None:
-            state.clear(sender_id)
+        if stored_msg is None:
+            state.clear(session_key)
             await event.reply(
                 "❌ Could not save media to storage channel.\n"
                 "Make sure the bot is an admin of STORAGE_CHANNEL_ID "
@@ -599,21 +679,31 @@ async def _handle_state_reply_inner(event, sender_id: int, current) -> bool:
             )
             return True
 
+        storage_msg_id = stored_msg.id
+        media_ref = _serialize_media(getattr(stored_msg, "media", None) or msg.media)
+
         await db.upsert_trigger(
             trigger_text, group_id,
             storage_type="media",
-            storage_text=None,
-            storage_chat_id=config.STORAGE_CHANNEL_ID,
-            storage_message_id=storage_msg_id,
+            storage_text=content_text or None,
+            storage_chat_id=None if config.STORAGE_DELETE_AFTER_SAVE else config.STORAGE_CHANNEL_ID,
+            storage_message_id=None if config.STORAGE_DELETE_AFTER_SAVE else storage_msg_id,
+            storage_media_b64=media_ref,
         )
+        await _delete_storage_message(event.client, storage_msg_id)
         await _refresh_group_cache(group_id)
-        state.clear(sender_id)
+        state.clear(session_key)
 
         media_type = "sticker" if _is_sticker(msg.media) else "media"
+        storage_note = (
+            "hidden storage"
+            if config.STORAGE_DELETE_AFTER_SAVE
+            else f"storage channel msg `{storage_msg_id}`"
+        )
         await event.reply(
             f"✅ Trigger saved!\n\n"
             f"🔑 Keyword: `{trigger_text}`\n"
-            f"📦 Type: {media_type} — stored in storage channel (msg `{storage_msg_id}`)\n\n"
+            f"📦 Type: {media_type} — {storage_note}\n\n"
             "You can delete this message — the trigger still works.",
             parse_mode="md",
         )
@@ -631,7 +721,7 @@ async def handle_trigger_match(event: events.NewMessage.Event) -> bool:
     Check if any trigger for THIS group matches the incoming message.
     Longest match wins. Returns True if a trigger was fired.
     """
-    text = event.text or event.caption or ""
+    text = _message_content_text(event.message)
     if not text:
         return False
 
@@ -666,6 +756,22 @@ async def handle_trigger_match(event: events.NewMessage.Event) -> bool:
         return True
 
     # ── MEDIA delivery — copy from storage (no "Forwarded from" header) ───────
+    media_ref = _deserialize_media(matched.get("storage_media_b64"))
+    if media_ref:
+        try:
+            await event.client.send_file(
+                event.chat_id,
+                media_ref,
+                caption=matched.get("storage_text") or None,
+                parse_mode="html",
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Hidden media trigger '%s' delivery failed, trying storage message fallback: %s",
+                matched["trigger"], e,
+            )
+
     chat_id = matched.get("storage_chat_id") or matched.get("source_chat_id")
     msg_id  = matched.get("storage_message_id") or matched.get("source_message_id")
 

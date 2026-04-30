@@ -22,6 +22,13 @@ def _int_list(name: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 # ── Telegram ───────────────────────────────────────────────────────────────────
 API_ID: int = int(_require("API_ID"))
 API_HASH: str = _require("API_HASH")
@@ -58,3 +65,8 @@ INDEX_LIMIT: int = int(os.getenv("INDEX_LIMIT", "5000"))
 # Group admins can safely delete the original setup message from the group.
 # Set this to the numeric channel ID (-100...).
 STORAGE_CHANNEL_ID: int = int(_require("STORAGE_CHANNEL_ID"))
+
+# If true, the bot deletes the visible storage-channel post after saving a
+# Telegram media reference in MongoDB. This keeps the storage channel looking
+# empty to channel members.
+STORAGE_DELETE_AFTER_SAVE: bool = _bool("STORAGE_DELETE_AFTER_SAVE", True)

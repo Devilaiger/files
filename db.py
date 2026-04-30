@@ -143,6 +143,7 @@ async def upsert_trigger(
     storage_text: Optional[str],
     storage_chat_id: Optional[int],
     storage_message_id: Optional[int],
+    storage_media_b64: Optional[str] = None,
 ) -> None:
     key = trigger_text.lower().strip()
     now = datetime.now(timezone.utc)
@@ -155,10 +156,12 @@ async def upsert_trigger(
         set_doc["storage_text"]       = storage_text
         set_doc["storage_chat_id"]    = None
         set_doc["storage_message_id"] = None
+        set_doc["storage_media_b64"]  = None
     else:
-        set_doc["storage_text"]       = None
+        set_doc["storage_text"]       = storage_text
         set_doc["storage_chat_id"]    = storage_chat_id
         set_doc["storage_message_id"] = storage_message_id
+        set_doc["storage_media_b64"]  = storage_media_b64
 
     await triggers_col.update_one(
         {"trigger": key, "group_id": group_id},
@@ -178,6 +181,24 @@ async def fetch_triggers_for_group(group_id: int) -> list[dict]:
 
 async def fetch_all_triggers() -> list[dict]:
     return await triggers_col.find().sort("created_at", 1).to_list(length=None)
+
+
+async def update_trigger_hidden_media(
+    trigger_id,
+    storage_text: Optional[str],
+    storage_media_b64: str,
+) -> None:
+    await triggers_col.update_one(
+        {"_id": trigger_id},
+        {
+            "$set": {
+                "storage_text": storage_text,
+                "storage_media_b64": storage_media_b64,
+                "storage_chat_id": None,
+                "storage_message_id": None,
+            }
+        },
+    )
 
 
 async def delete_trigger_at_index(
