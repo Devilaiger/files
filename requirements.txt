@@ -3,6 +3,8 @@ telethon==1.36.0
 motor==3.4.0
 pymongo==4.7.2
 
+flask>=2.0.0
+
 # Fuzzy search
 rapidfuzz==3.9.3
 
