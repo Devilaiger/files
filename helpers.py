@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import unicodedata
 from typing import Optional
 
@@ -60,6 +61,40 @@ async def is_user_admin(event, chat_id: int = None) -> bool:
         return False
 
 
+# ── Admin permission TTL cache ───────────────────────────────────────────────────
+# Caches the result of is_admin() per (sender_id, chat_id) for 15 minutes.
+# This prevents repeated Telegram API calls during rapid command usage while
+# keeping the exact permission hierarchy unchanged.
+#
+# The cache is intentionally NOT applied to config.ADMIN_IDS (that's O(1))
+# or to the Adder check (single DB read).  Only the Bot Admin / Telegram
+# Admin lookups — which hit the API — are cached.
+
+_ADMIN_CACHE_TTL: float = 900.0  # 15 minutes in seconds
+# {(sender_id, chat_id): (result: bool, expires_at: float)}
+_admin_cache: dict[tuple[int, int], tuple[bool, float]] = {}
+
+
+def invalidate_admin_cache(user_id: int | None = None, chat_id: int | None = None) -> int:
+    """
+    Remove cache entries matching user_id and/or chat_id.
+    Pass neither to flush the entire cache.
+    Returns the number of entries removed.
+    """
+    if user_id is None and chat_id is None:
+        count = len(_admin_cache)
+        _admin_cache.clear()
+        return count
+    keys = [
+        k for k in _admin_cache
+        if (user_id is None or k[0] == user_id)
+        and (chat_id is None or k[1] == chat_id)
+    ]
+    for k in keys:
+        _admin_cache.pop(k, None)
+    return len(keys)
+
+
 async def is_admin(event, chat_id: int = None) -> bool:
     """
     Return True if the event sender is an authorised admin for the target chat.
@@ -70,8 +105,12 @@ async def is_admin(event, chat_id: int = None) -> bool:
       2. Adder: The user who invited the bot (db.get_group_adder)
       3. Bot Admin: Users explicitly added via /add_bot_admin (db.get_group_authority)
       4. Telegram Admin: Standard group admins, unless explicitly banned.
+
+    Result is cached per (sender_id, chat_id) for 15 minutes (configurable via
+    _ADMIN_CACHE_TTL) to avoid repeated Telegram API calls.
     """
     sender_id = event.sender_id
+    # Authorized Bot Administrators are always allowed — no cache needed.
     if sender_id in config.ADMIN_IDS:
         logger.info(f"Admin check granted: User {sender_id} is an Authorized Bot Administrator.")
         return True
@@ -81,9 +120,19 @@ async def is_admin(event, chat_id: int = None) -> bool:
         logger.info("Admin check denied: No target_chat_id for authorization.")
         return False
 
-    # If we are in a PM and no specific group was targetted, standard user is not admin.
+    # If we are in a PM and no specific group was targeted, standard user is not admin.
     if event.is_private and chat_id is None:
         return False
+
+    # ── TTL cache lookup ─────────────────────────────────────────────────
+    cache_key = (sender_id, target_chat_id)
+    cached = _admin_cache.get(cache_key)
+    if cached is not None and cached[1] > time.monotonic():
+        logger.debug(
+            "Admin cache HIT for user %s in chat %s (result=%s, ttl=%.0fs left).",
+            sender_id, target_chat_id, cached[0], cached[1] - time.monotonic(),
+        )
+        return cached[0]
 
     import db  # Local import to avoid circularity
 
@@ -91,20 +140,31 @@ async def is_admin(event, chat_id: int = None) -> bool:
     adder_id = await db.get_group_adder(target_chat_id)
     if sender_id == adder_id:
         logger.info(f"Admin check granted: User {sender_id} is the Adder of {target_chat_id}")
-        return True
+        result = True
+    else:
+        # 2. Check if user is in allowed_ids or banned_ids
+        auth = await db.get_group_authority(target_chat_id)
+        if auth:
+            if sender_id in auth.get("allowed_ids", []):
+                logger.info(f"Admin check granted: User {sender_id} is an authorized Bot Admin for {target_chat_id}")
+                result = True
+            elif sender_id in auth.get("banned_ids", []):
+                logger.info(f"Admin check denied: User {sender_id} is explicitly banned in {target_chat_id}")
+                result = False
+            else:
+                # 3. Fallback: Standard Telegram Admin check
+                result = await is_user_admin(event, chat_id=target_chat_id)
+        else:
+            # 3. Fallback: Standard Telegram Admin check
+            result = await is_user_admin(event, chat_id=target_chat_id)
 
-    # 2. Check if user is in allowed_ids or banned_ids
-    auth = await db.get_group_authority(target_chat_id)
-    if auth:
-        if sender_id in auth.get("allowed_ids", []):
-            logger.info(f"Admin check granted: User {sender_id} is an authorized Bot Admin for {target_chat_id}")
-            return True
-        if sender_id in auth.get("banned_ids", []):
-            logger.info(f"Admin check denied: User {sender_id} is explicitly banned in {target_chat_id}")
-            return False
-
-    # 3. Fallback: Standard Telegram Admin check
-    return await is_user_admin(event, chat_id=target_chat_id)
+    # ── Store in cache ──────────────────────────────────────────────────────────────
+    _admin_cache[cache_key] = (result, time.monotonic() + _ADMIN_CACHE_TTL)
+    logger.debug(
+        "Admin cache SET for user %s in chat %s (result=%s, ttl=%ds).",
+        sender_id, target_chat_id, result, int(_ADMIN_CACHE_TTL),
+    )
+    return result
 
 
 # ── Text normalisation ─────────────────────────────────────────────────────────

@@ -152,6 +152,7 @@ async def cmd_help(event: events.NewMessage.Event) -> None:
         text += "`/set_trigger` — start trigger wizard\n"
         text += "`/trigger_list` — list current triggers\n"
         text += "`/delete <index>` — remove a trigger\n"
+        text += "`/activate_triggers` — register a new group\n"
         text += "`/add_bot_admin <id/user>` — add group-level admin\n"
         text += "`/rem_bot_admin <id/user>` — remove group-level admin\n"
         text += "`/cancel` — abort active wizard\n"
@@ -365,7 +366,14 @@ async def cmd_refresh_admins(event: events.NewMessage.Event) -> None:
                         tg_admins.append(p.id)
             
             await db.upsert_group_authority(chat_id, final_adder_id, allowed_ids=tg_admins)
-            
+
+            # Invalidate the admin cache for this group so the new list is
+            # picked up immediately on the next command (Feature 5).
+            from helpers import invalidate_admin_cache
+            evicted = invalidate_admin_cache(chat_id=chat_id)
+            if evicted:
+                logger.debug("Admin cache: evicted %d entry/entries for group %s.", evicted, chat_id)
+
             await event.reply(
                 f"✅ Success! **{final_adder_id}** is now recorded as the **Bot Adder**.\n"
                 f"🔄 Admin list synced: **{len(tg_admins)}** Telegram admins added to Bot Admins (excluding manually removed ones).\n\n"
@@ -394,6 +402,10 @@ async def startup() -> None:
     await db.migrate()
     await db.cleanup_invalid_ids()
 
+    # Restore in-progress admin sessions from last run (Feature 3).
+    # Must be done before client.start() so wizards resume seamlessly.
+    state.load()
+
     logger.info("Warming per-group trigger cache…")
     await cache.warm(db.fetch_all_triggers)
 
@@ -415,6 +427,9 @@ async def startup() -> None:
 
     triggers.register(client)
     search.register(client)
+
+    # Start silent background task: saves state.json every 5 s (Feature 3).
+    state.start_background_save()
 
     logger.info("Bot ready.")
 
@@ -438,6 +453,7 @@ async def main() -> None:
 def _handle_signal(sig, frame):
     """Handle shutdown signals gracefully."""
     logger.info("Received signal %s — shutting down…", sig)
+    sys.exit(0)
 
 
 signal.signal(signal.SIGINT, _handle_signal)

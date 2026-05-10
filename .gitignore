@@ -10,6 +10,14 @@ venv/
 # VS Code
 .vscode/
 
+#session
+.session
+.session-journal
+
+#agent
+.agent
+
+
 # Logs
 *.log
 

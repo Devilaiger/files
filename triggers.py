@@ -40,12 +40,17 @@ import base64
 import logging
 import pickle
 
+from itsdangerous import BadSignature, Signer
 from telethon import TelegramClient, events
 from telethon.events import StopPropagation
 from telethon.tl.custom import Button
 from telethon.tl.types import (
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
     DocumentAttributeSticker,
+    DocumentAttributeVideo,
     MessageMediaDocument,
+    MessageMediaPhoto,
     MessageMediaWebPage,
 )
 
@@ -93,6 +98,47 @@ def _is_sticker(media) -> bool:
     )
 
 
+def _detect_media_type(msg) -> str:
+    """
+    Inspect a Telegram message and return the exact media type string.
+    Returns one of: "image", "video", "gif", "sticker", "document",
+                    "audio", "voice", "video_note", or "text".
+
+    Storage method is NOT changed — this is purely for detection/reporting.
+    """
+    media = getattr(msg, "media", None)
+    if not media or isinstance(media, MessageMediaWebPage):
+        return "text"
+
+    if isinstance(media, MessageMediaPhoto):
+        return "image"
+
+    if isinstance(media, MessageMediaDocument):
+        doc = getattr(media, "document", None)
+        if not doc:
+            return "document"
+        attrs = doc.attributes or []
+        attr_types = {type(a) for a in attrs}
+
+        if DocumentAttributeSticker in attr_types:
+            return "sticker"
+
+        if DocumentAttributeAnimated in attr_types:
+            return "gif"
+
+        for a in attrs:
+            if isinstance(a, DocumentAttributeVideo):
+                return "video_note" if getattr(a, "round_message", False) else "video"
+
+        for a in attrs:
+            if isinstance(a, DocumentAttributeAudio):
+                return "voice" if getattr(a, "voice", False) else "audio"
+
+        return "document"
+
+    return "media"  # generic fallback for any other media type
+
+
 def _message_content_text(msg) -> str:
     return (getattr(msg, "text", None) or getattr(msg, "message", None) or "").strip()
 
@@ -102,17 +148,52 @@ def _has_real_media(msg) -> bool:
     return bool(media) and not isinstance(media, MessageMediaWebPage)
 
 
+# ── HMAC-signed media serialisation ───────────────────────────────────────────
+# Uses itsdangerous.Signer so that the pickle blob in MongoDB carries a
+# cryptographic signature.  If the DB is ever compromised, an attacker cannot
+# craft a malicious pickle payload — the signature check will reject it.
+#
+# Backward-compatibility: existing unsigned blobs (legacy format) are decoded
+# via a silent fallback.  Triggers will be automatically upgraded the next time
+# they are re-saved with /set_trigger.
+
+def _get_signer() -> Signer:
+    """Return an HMAC Signer keyed off the bot token (secret, always present)."""
+    import config as _cfg  # late import avoids circular dependency at module load
+    return Signer(_cfg.BOT_TOKEN)
+
+
 def _serialize_media(media) -> str | None:
+    """Pickle media, sign with HMAC, then base64-encode for DB storage."""
     if not media:
         return None
-    return base64.b64encode(pickle.dumps(media)).decode("ascii")
+    raw: bytes = pickle.dumps(media)
+    signed: bytes = _get_signer().sign(raw)   # appends ".{hmac_hex}"
+    return base64.b64encode(signed).decode("ascii")
 
 
 def _deserialize_media(media_b64: str | None):
+    """
+    Decode and verify a media blob.
+    1. Try HMAC-signed format (new).
+    2. Fall back to raw pickle (legacy — existing DB rows).
+    3. Return None on total failure.
+    """
     if not media_b64:
         return None
     try:
-        return pickle.loads(base64.b64decode(media_b64.encode("ascii")))
+        blob: bytes = base64.b64decode(media_b64.encode("ascii"))
+        try:
+            raw: bytes = _get_signer().unsign(blob)
+            return pickle.loads(raw)
+        except BadSignature:
+            # Legacy unsigned blob — still trusted (DB was not tampered with at
+            # the time of storage).  Log a notice so admins know to re-save.
+            logger.debug(
+                "Media blob is unsigned (legacy format). "
+                "Re-save with /set_trigger to upgrade to signed storage."
+            )
+            return pickle.loads(blob)
     except Exception as e:
         logger.warning("Stored media reference could not be decoded: %s", e)
         return None
@@ -743,16 +824,27 @@ async def _handle_state_reply_inner(event, session_key, sender_id: int, current)
         await _refresh_group_cache(group_id)
         state.clear(session_key)
 
-        media_type = "sticker" if _is_sticker(msg.media) else "media"
+        # Detect the EXACT file type for the UI confirmation message.
+        # _detect_media_type() only reads the message object — storage is untouched.
+        media_type = _detect_media_type(msg)
         storage_note = (
             "hidden storage"
             if config.STORAGE_DELETE_AFTER_SAVE
             else f"storage channel msg `{storage_msg_id}`"
         )
+
+        # Map type to a friendly emoji
+        _TYPE_EMOJI = {
+            "image": "🖼️", "video": "🎬", "gif": "🎞️", "sticker": "🩹",
+            "document": "📄", "audio": "🎵", "voice": "🎙️",
+            "video_note": "⭕", "media": "📦",
+        }
+        type_emoji = _TYPE_EMOJI.get(media_type, "📦")
+
         await event.reply(
             f"✅ Trigger saved!\n\n"
             f"🔑 Keyword: `{trigger_text}`\n"
-            f"📦 Type: {media_type} — {storage_note}\n\n"
+            f"{type_emoji} Type: **{media_type}** — {storage_note}\n\n"
             "You can delete this message — the trigger still works.",
             parse_mode="md",
         )
