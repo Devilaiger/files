@@ -3,7 +3,7 @@ triggers.py — Feature 1: Per-Group Trigger -> Message Replay
 
 Permission model
 ----------------
-  env ADMIN_IDS  : super-admin, unlimited access to any group.
+  env ADMIN_IDS  : Authorized Bot Administrator, unlimited access to any group.
                    Can use trigger commands from PM by supplying group_id.
   Group admin    : can manage triggers ONLY for their own group, from inside it.
   Normal user    : no access.
@@ -251,17 +251,11 @@ async def _resolve_group_id(event) -> tuple:
     """
     Determine which group_id a trigger command targets.
     Inside a group  -> group_id = event.chat_id (always; user args ignored).
-    From PM         -> only env ADMIN_IDS; group_id must be first arg.
+    From PM         -> allows any user to supply a group_id (permission checked later).
     Returns (group_id, error_message). error_message is None on success.
     """
     if not event.is_private:
         return event.chat_id, None
-
-    if event.sender_id not in config.ADMIN_IDS:
-        return None, (
-            "Trigger commands must be run inside a registered search group.\n"
-            "Use /connect_as search in the target group first."
-        )
 
     parts = event.text.strip().split(maxsplit=2)
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
@@ -271,26 +265,21 @@ async def _resolve_group_id(event) -> tuple:
             "Get the group ID from /list_search_groups"
         )
 
-    return int(parts[1]), None
+    target_group_id = int(parts[1])
+    # The actual permission check happens in the calling handler using _require_trigger_permission
+    return target_group_id, None
 
 
 async def _require_trigger_permission(event, group_id: int) -> bool:
     """
-    env ADMIN_IDS        -> always allowed (any group)
-    Telegram group admin -> allowed only for their own group, from inside it
-    Normal user          -> denied
+    Check if the user has permission to manage triggers for the given group.
+    Uses the unified Plan B hierarchy in helpers.is_admin.
     """
-    sender_id = event.sender_id
-    if sender_id in config.ADMIN_IDS:
-        return True
-    if not event.is_private and event.chat_id == group_id:
-        try:
-            perms = await event.client.get_permissions(event.chat_id, sender_id)
-            if perms.is_admin or perms.is_creator:
-                return True
-        except Exception:
-            pass
-    return False
+    from helpers import is_admin
+    # Note: helpers.is_admin checks config.ADMIN_IDS, Adder, Bot Admins, and Telegram Admins.
+    # We pass the target group_id to ensure authority is checked for that group, 
+    # even if the command/wizard response arrives from a different chat (like PM).
+    return await is_admin(event, chat_id=group_id)
 
 
 async def _require_search_group(group_id: int, reply_event) -> bool:
@@ -320,6 +309,17 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
     if not await _require_search_group(group_id, event):
         raise StopPropagation
 
+    # ── BOT PERMISSION CHECK ──
+    from helpers import get_bot_permissions
+    bot_perms = await get_bot_permissions(event.client, group_id)
+    privacy_warning = ""
+    if not bot_perms or not bot_perms.is_admin:
+        privacy_warning = (
+            "\n\n⚠️ **WARNING**: The bot is **not an admin** in this group. "
+            "Due to Telegram's Privacy Mode, it might not see your text responses. "
+            "Please promote the bot to Admin for a smooth experience."
+        )
+
     sender_id = event.sender_id
 
     # Strip "/set_trigger" and (if PM) the group_id token to get the actual arg
@@ -336,6 +336,14 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
     initiated_chat_id = event.chat_id
     session_key = state.key(sender_id, initiated_chat_id)
 
+    # Get creator name for metadata
+    sender = await event.get_sender()
+    sender_name = getattr(sender, "first_name", "Unknown")
+    if getattr(sender, "last_name", None):
+        sender_name += f" {sender.last_name}"
+    elif not getattr(sender, "first_name", None):
+        sender_name = getattr(sender, "title", "Admin") # For anonymous admins
+
     # Method 3: reply to existing message (in-group only)
     if has_reply and not has_arg:
         replied = await event.get_reply_message()
@@ -349,12 +357,15 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
             trigger_text=trigger_text,
             group_id=group_id,
             initiated_chat_id=initiated_chat_id,
+            created_by_id=sender_id,
+            created_by_name=sender_name,
         )
         await event.reply(
             f"🔑 Keyword locked: `{trigger_text}`\n\n"
             "**Step 2/2 — Send the message to attach:**\n"
             "image, video, sticker, document, audio, text, or forward any message.\n\n"
-            "⚠️ Send it **in this chat only** — messages from other chats are ignored.",
+            "⚠️ Send it **in this chat only** — messages from other chats are ignored.\n"
+            "To abort, send /cancel",
             parse_mode="md",
         )
         raise StopPropagation
@@ -371,6 +382,8 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
             trigger_text=trigger_text,
             group_id=group_id,
             initiated_chat_id=initiated_chat_id,
+            created_by_id=sender_id,
+            created_by_name=sender_name,
         )
         await event.reply(
             f"🔑 Keyword locked: `{trigger_text}`\n\n"
@@ -387,11 +400,14 @@ async def cmd_set_trigger(event: events.NewMessage.Event) -> None:
         state.AWAIT_TRIGGER_TEXT,
         group_id=group_id,
         initiated_chat_id=initiated_chat_id,
+        created_by_id=sender_id,
+        created_by_name=sender_name,
     )
     await event.reply(
         f"**Step 1/2 — Type the trigger keyword** (text only, e.g. `chainsaw man`).\n"
         f"Group: `{group_id}`\n\n"
-        "⚠️ Respond **in this chat only** — other chats are ignored.",
+        f"⚠️ Respond **in this chat only**.\n"
+        f"To abort, send /cancel{privacy_warning}",
         parse_mode="md",
     )
     raise StopPropagation
@@ -538,19 +554,39 @@ async def handle_state_reply(event: events.NewMessage.Event) -> bool:
     flight_key = (sender_id, msg_id)
 
     session_key = state.key(sender_id, event.chat_id)
-    current = state.get(session_key) or state.get(sender_id)
+    current = state.get(session_key)
+    
     if not current:
-        return False
+        # Fallback: check if user has ANY active state to provide helpful isolation feedback
+        k, current = state.find_for_user(sender_id)
+        if not current:
+            return False
 
     # ── CHAT ISOLATION CHECK ─────────────────────────────────────────────────
     initiated_chat_id = current.data.get("initiated_chat_id")
     if initiated_chat_id is not None and event.chat_id != initiated_chat_id:
-        # Different chat — do NOT consume this message. Let it flow normally.
-        logger.debug(
-            "Wizard isolation: ignoring msg from chat %s (wizard locked to chat %s) for user %s",
-            event.chat_id, initiated_chat_id, sender_id,
+        # Different chat — do NOT consume this message.
+        # We don't reply here to avoid spamming other groups, but we log it.
+        logger.info(
+            "Wizard isolation: user %s sent msg in chat %s, but their active wizard is locked to chat %s. Ignoring message.",
+            sender_id, event.chat_id, initiated_chat_id,
         )
         return False
+
+    # ── USER ISOLATION CHECK ─────────────────────────────────────────────────
+    # Ensure ONLY the person who started the wizard can interact with it.
+    created_by_id = current.data.get("created_by_id")
+    if created_by_id is not None and sender_id != created_by_id:
+        # Another user in the SAME chat sent a message.
+        # We definitely don't want to consume this, but we also don't want to reply 
+        # because it might be a regular group member just chatting.
+        logger.debug(
+            "Wizard isolation: user %s sent msg in chat %s, but wizard was started by %s. Ignoring message.",
+            sender_id, event.chat_id, created_by_id,
+        )
+        return False
+
+    logger.info("Processing wizard state '%s' for user %s in chat %s", current.step, sender_id, event.chat_id)
 
     if flight_key in _in_flight:
         return True
@@ -563,6 +599,12 @@ async def handle_state_reply(event: events.NewMessage.Event) -> bool:
 
 
 async def _handle_state_reply_inner(event, session_key, sender_id: int, current) -> bool:
+    # ── PERMISSION RE-VERIFICATION ───────────────────────────────────────────
+    group_id = current.data.get("group_id")
+    if not await _require_trigger_permission(event, group_id):
+        state.clear(session_key)
+        await event.reply("❌ Permission lost. Wizard closed.")
+        return True
     # ── Step 1: waiting for trigger keyword (interactive wizard) ──────────────
     if current.step == state.AWAIT_TRIGGER_TEXT:
         # Step 1 only accepts plain text — reject media with a helpful message
@@ -584,14 +626,17 @@ async def _handle_state_reply_inner(event, session_key, sender_id: int, current)
             session_key,
             state.AWAIT_TRIGGER_MSG,
             trigger_text=trigger_text,
-            group_id=current.data.get("group_id"),
+            group_id=group_id,
             initiated_chat_id=current.data.get("initiated_chat_id"),
+            created_by_id=current.data.get("created_by_id"),
+            created_by_name=current.data.get("created_by_name"),
         )
         await event.reply(
             f"✅ Keyword: `{trigger_text}`\n\n"
             "**Step 2/2 — Send the message to attach:**\n"
             "image, video, sticker, document, audio, text, or forward any message.\n\n"
-            "⚠️ Send it **in this chat only**.",
+            "⚠️ Send it **in this chat only**.\n"
+            "To abort, send /cancel",
             parse_mode="md",
         )
         return True
@@ -630,6 +675,8 @@ async def _handle_state_reply_inner(event, session_key, sender_id: int, current)
                 storage_text=content_text,
                 storage_chat_id=None,
                 storage_message_id=None,
+                created_by_id=current.data.get("created_by_id"),
+                created_by_name=current.data.get("created_by_name"),
             )
             await _refresh_group_cache(group_id)
             state.clear(session_key)
@@ -689,6 +736,8 @@ async def _handle_state_reply_inner(event, session_key, sender_id: int, current)
             storage_chat_id=None if config.STORAGE_DELETE_AFTER_SAVE else config.STORAGE_CHANNEL_ID,
             storage_message_id=None if config.STORAGE_DELETE_AFTER_SAVE else storage_msg_id,
             storage_media_b64=media_ref,
+            created_by_id=current.data.get("created_by_id"),
+            created_by_name=current.data.get("created_by_name"),
         )
         await _delete_storage_message(event.client, storage_msg_id)
         await _refresh_group_cache(group_id)

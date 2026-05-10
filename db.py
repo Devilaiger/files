@@ -8,14 +8,16 @@ Collections
   search_groups     – groups/channels where bot actively responds to triggers & Show:
   channel_mappings  – search_group ↔ main_channel relationships (Feature 2)
   posts_index       – indexed post text + references from main_channels
+  group_authority   – per-group bot admin authority (adder, owner, allowed/banned list)
 
 Schema: triggers
-  {trigger, group_id, source_chat_id, source_message_id, created_at}
-  unique index: (trigger, group_id)  ← same keyword allowed in different groups
+  {trigger, group_id, storage_type, storage_text, storage_chat_id, storage_message_id,
+   storage_media_b64, created_at, created_by_id, created_by_name}
+  unique index: (trigger, group_id)
 
-Schema: channel_mappings
-  {search_group_id, main_channel_id, connected_by, connected_at}
-  unique index: (search_group_id, main_channel_id)
+Schema: group_authority
+  {group_id, adder_id, owner_id, allowed_ids: [...], banned_ids: [...], updated_at}
+  unique index: group_id
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ main_channels_col    = _db["main_channels"]
 search_groups_col    = _db["search_groups"]
 channel_mappings_col = _db["channel_mappings"]
 posts_col            = _db["posts_index"]
+group_authority_col  = _db["group_authority"]
 
 
 # ── Index setup ────────────────────────────────────────────────────────────────
@@ -73,6 +76,9 @@ async def setup_indexes() -> None:
         [("channel_id", 1), ("message_id", 1)], unique=True
     )
     await posts_col.create_index("normalized_text")
+
+    await group_authority_col.create_index("group_id", unique=True)
+
     logger.info("MongoDB indexes verified.")
 
 
@@ -133,7 +139,124 @@ async def migrate() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TRIGGERS  (per-group)
+#  GROUP AUTHORITY  (Plan B: Adder-controlled bot admin system)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def upsert_group_authority(
+    group_id: int,
+    adder_id: int,
+    owner_id: Optional[int] = None,
+    allowed_ids: Optional[list[int]] = None,
+) -> None:
+    """
+    Create or update the authority record for a group.
+    Called when the bot is first added to a group or when admins are refreshed.
+    If allowed_ids is provided, it updates the list.
+    """
+    now = datetime.now(timezone.utc)
+    
+    # First check if document exists - if yes, we need to use different update logic
+    existing = await group_authority_col.find_one({"group_id": group_id})
+    
+    if existing:
+        # Document exists - use simple update without $setOnInsert
+        update_doc: dict = {
+            "adder_id":   adder_id,
+            "owner_id":   owner_id,
+            "updated_at": now,
+        }
+        if allowed_ids is not None:
+            # FIX: If allowed_ids is provided, set it directly
+            # Use $set directly for existing documents to avoid the conflict
+            update_doc["allowed_ids"] = allowed_ids
+        
+        await group_authority_col.update_one(
+            {"group_id": group_id},
+            {"$set": update_doc},
+        )
+    else:
+        # New document - use upsert with $setOnInsert
+        await group_authority_col.update_one(
+            {"group_id": group_id},
+            {
+                "$setOnInsert": {
+                    "group_id":    group_id,
+                    "adder_id":    adder_id,
+                    "owner_id":    owner_id,
+                    "allowed_ids": allowed_ids if allowed_ids is not None else [],
+                    "banned_ids": [],
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+
+
+async def get_group_authority(group_id: int) -> Optional[dict]:
+    return await group_authority_col.find_one({"group_id": group_id})
+
+
+async def add_bot_admin(group_id: int, user_id: int) -> bool:
+    """
+    Add user_id to the allowed_ids list and remove from banned_ids.
+    Returns True if modified.
+    """
+    r = await group_authority_col.update_one(
+        {"group_id": group_id},
+        {
+            "$addToSet": {"allowed_ids": user_id},
+            "$pull":     {"banned_ids": user_id},
+            "$set":      {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    return r.modified_count > 0
+
+
+async def remove_bot_admin(group_id: int, user_id: int) -> bool:
+    """
+    Remove user_id from allowed_ids and add to banned_ids.
+    This ban survives /refresh — only re-add via add_bot_admin can lift it.
+    Returns True if modified.
+    """
+    r = await group_authority_col.update_one(
+        {"group_id": group_id},
+        {
+            "$pull":     {"allowed_ids": user_id},
+            "$addToSet": {"banned_ids": user_id},
+            "$set":      {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    return r.modified_count > 0
+
+
+async def is_bot_admin_allowed(group_id: int, user_id: int) -> bool:
+    """
+    Check if a user_id is explicitly banned from this group's bot management.
+    Used as a secondary check after Telegram admin verification.
+    Returns True if NOT banned (i.e., allowed to proceed).
+    Returns False if banned.
+    """
+    doc = await group_authority_col.find_one({"group_id": group_id})
+    if not doc:
+        return True  # No authority record yet — allow (first-time setup)
+    banned = doc.get("banned_ids", [])
+    return user_id not in banned
+
+
+async def get_group_adder(group_id: int) -> Optional[int]:
+    doc = await group_authority_col.find_one({"group_id": group_id}, {"adder_id": 1})
+    return doc.get("adder_id") if doc else None
+
+
+async def get_group_owner(group_id: int) -> Optional[int]:
+    doc = await group_authority_col.find_one({"group_id": group_id}, {"owner_id": 1})
+    return doc.get("owner_id") if doc else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRIGGERS  (per-group, with creator metadata)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def upsert_trigger(
@@ -144,6 +267,8 @@ async def upsert_trigger(
     storage_chat_id: Optional[int],
     storage_message_id: Optional[int],
     storage_media_b64: Optional[str] = None,
+    created_by_id: Optional[int] = None,
+    created_by_name: Optional[str] = None,
 ) -> None:
     key = trigger_text.lower().strip()
     now = datetime.now(timezone.utc)
@@ -163,9 +288,16 @@ async def upsert_trigger(
         set_doc["storage_message_id"] = storage_message_id
         set_doc["storage_media_b64"]  = storage_media_b64
 
+    # Update creator info only on new insert ($setOnInsert)
+    insert_doc = {
+        "created_at":      now,
+        "created_by_id":   created_by_id,
+        "created_by_name": created_by_name,
+    }
+
     await triggers_col.update_one(
         {"trigger": key, "group_id": group_id},
-        {"$set": set_doc, "$setOnInsert": {"created_at": now}},
+        {"$set": set_doc, "$setOnInsert": insert_doc},
         upsert=True,
     )
 

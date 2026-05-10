@@ -51,43 +51,10 @@ def _message_text(message: Message) -> str:
 
 # ── Permission helpers ────────────────────────────────────────────────────────
 
-async def _is_admin_in_chat(client: TelegramClient, chat_id: int, user_id: int) -> bool:
-    """Check if user_id is an admin in the specific chat_id."""
-    if user_id in config.ADMIN_IDS:
-        return True
-    try:
-        perms = await client.get_permissions(chat_id, user_id)
-        return perms.is_admin or perms.is_creator
-    except Exception:
-        return False
-
-
-async def _require_admin(event) -> bool:
-    """
-    Returns True if the sender is allowed to run admin commands in this context.
-    - ADMIN_IDS: always allowed, from anywhere.
-    - Telegram group admin: allowed only when running the command inside their group.
-    - PM senders not in ADMIN_IDS: denied.
-    """
+async def _require_env_admin(event) -> bool:
+    """Restrict experimental commands to .env admins only."""
     if event.sender_id in config.ADMIN_IDS:
         return True
-    if event.is_private:
-        return False
-    try:
-        perms = await event.client.get_permissions(event.chat_id, event.sender_id)
-        return perms.is_admin or perms.is_creator
-    except Exception:
-        return False
-
-
-async def _require_superadmin_from_pm(event) -> bool:
-    """For commands that are global in scope, require ADMIN_IDS when called from PM."""
-    if event.sender_id in config.ADMIN_IDS:
-        return True
-    await event.reply(
-        "This command requires super-admin access from a private message.\n"
-        "Run it inside your group, or ask a super-admin."
-    )
     return False
 
 
@@ -96,14 +63,8 @@ async def _require_superadmin_from_pm(event) -> bool:
 # ==============================================================================
 
 async def cmd_add_mainchannel(event: events.NewMessage.Event) -> None:
-    """
-    /add_mainchannel <id|@username>
-    Registers a channel as a main content source and immediately indexes it.
-    Allowed for: ADMIN_IDS (from anywhere) or Telegram group admin (from their group).
-    """
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     parts = event.text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -145,7 +106,7 @@ async def cmd_add_channel_search(event: events.NewMessage.Event) -> None:
         )
         raise StopPropagation
 
-    if not await _require_admin(event):
+    if not await is_admin(event):
         await event.reply("Admin only.")
         raise StopPropagation
 
@@ -159,9 +120,8 @@ async def cmd_add_channel_search(event: events.NewMessage.Event) -> None:
 
     await db.add_search_group(group_id, title, event.sender_id)
     await event.reply(
-        f"{title} registered as a search group.\n\n"
-        f"Next: link it to a main channel with:\n"
-        f"/connect_channel @channel_username"
+        f"✅ **{title}** is now registered!\n\n"
+        "You can now manage group-specific triggers using `/set_trigger`."
     )
     raise StopPropagation
 
@@ -178,7 +138,7 @@ async def cmd_connect_channel(event: events.NewMessage.Event) -> None:
         )
         raise StopPropagation
 
-    if not await _require_admin(event):
+    if not await is_admin(event):
         await event.reply("Admin only.")
         raise StopPropagation
 
@@ -218,11 +178,9 @@ async def cmd_connect_channel(event: events.NewMessage.Event) -> None:
         )
         raise StopPropagation
 
-    # Must be admin in the main channel too (prevents connecting arbitrary channels)
-    in_main = await _is_admin_in_chat(event.client, main_id, sender_id)
-    if not in_main:
-        await event.reply(f"You must be an admin in {main_title} to connect it.")
-        raise StopPropagation
+    # Connection logic: we allow any group admin to connect to a channel 
+    # as long as it's already registered as a main channel in the bot.
+    # This enables the "free to use" model for group admins.
 
     if await db.has_mapping(search_id, main_id):
         await event.reply(f"This group is already connected to {main_title}.")
@@ -241,17 +199,8 @@ async def cmd_connect_channel(event: events.NewMessage.Event) -> None:
 
 
 async def cmd_disconnect_channel(event: events.NewMessage.Event) -> None:
-    """
-    /disconnect_channel <main_channel>
-    Run INSIDE the search group to remove a specific main-channel link.
-    """
-    if event.is_private:
-        await event.reply("Run /disconnect_channel <main_channel> inside the search group.")
-        raise StopPropagation
-
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     parts = event.text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -278,15 +227,8 @@ async def cmd_disconnect_channel(event: events.NewMessage.Event) -> None:
 # ==============================================================================
 
 async def cmd_connect_as(event: events.NewMessage.Event) -> None:
-    if event.is_private:
-        await event.reply(
-            "Run /connect_as main or /connect_as search inside the target group or channel."
-        )
-        raise StopPropagation
-
-    if not await _require_admin(event):
-        await event.reply("You must be an admin of this chat to connect it.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     parts = event.text.strip().split(maxsplit=1)
     if len(parts) < 2 or parts[1].strip().lower() not in ("main", "search"):
@@ -320,13 +262,8 @@ async def cmd_connect_as(event: events.NewMessage.Event) -> None:
 
 
 async def cmd_disconnect(event: events.NewMessage.Event) -> None:
-    if event.is_private:
-        await event.reply("Run /disconnect inside the chat you want to remove.")
-        raise StopPropagation
-
-    if not await _require_admin(event):
-        await event.reply("You must be an admin of this chat to disconnect it.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     chat_id = event.chat_id
     chat = await event.get_chat()
@@ -362,14 +299,8 @@ async def cmd_disconnect(event: events.NewMessage.Event) -> None:
 # ==============================================================================
 
 async def cmd_list_main(event: events.NewMessage.Event) -> None:
-    """
-    /list_main
-    - Inside a group: shows only main channels connected to THIS group (group admin allowed).
-    - From PM: shows ALL main channels (ADMIN_IDS only).
-    """
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     # ── From PM: ADMIN_IDS only, global view ──────────────────────────────────
     if event.is_private:
@@ -439,14 +370,8 @@ async def cmd_list_search_groups(event: events.NewMessage.Event) -> None:
 
 
 async def cmd_list_connections(event: events.NewMessage.Event) -> None:
-    """
-    /list_connections
-    - Inside a group: shows THIS group's connections (group admin allowed).
-    - From PM with optional arg: /list_connections [group_id] (ADMIN_IDS only).
-    """
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     # ── From inside a group: always scoped to this group ──────────────────────
     if not event.is_private:
@@ -526,15 +451,8 @@ async def cmd_list_connections(event: events.NewMessage.Event) -> None:
 
 
 async def cmd_reindex(event: events.NewMessage.Event) -> None:
-    """
-    /reindex <channel_id or @username>
-    - Inside a group: allowed if caller is admin of this group AND the channel
-      is connected to this group.
-    - From PM: ADMIN_IDS only.
-    """
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     parts = event.text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -572,15 +490,8 @@ async def cmd_reindex(event: events.NewMessage.Event) -> None:
 
 
 async def cmd_channel_stats(event: events.NewMessage.Event) -> None:
-    """
-    /channel_stats
-    - Inside a group: shows stats for channels connected to THIS group only.
-      Allowed for Telegram group admins of that group (and ADMIN_IDS).
-    - From PM: shows all channels (ADMIN_IDS only).
-    """
-    if not await _require_admin(event):
-        await event.reply("Admin only.")
-        raise StopPropagation
+    """Restricted to .env admins."""
+    if not await _require_env_admin(event): return
 
     # ── From PM: ADMIN_IDS only, global view ──────────────────────────────────
     if event.is_private:
@@ -823,7 +734,7 @@ def register(client: TelegramClient) -> None:
     )
     client.add_event_handler(
         cmd_add_channel_search,
-        events.NewMessage(pattern=r"^/add_channel_search(?:\s|$)", incoming=True),
+        events.NewMessage(pattern=r"^/activate_triggers(?:\s|$)", incoming=True),
     )
     client.add_event_handler(
         cmd_connect_channel,
@@ -865,4 +776,4 @@ def register(client: TelegramClient) -> None:
         handle_new_channel_post,
         events.NewMessage(incoming=True),
     )
-    logger.info("Search handlers registered.")
+    logger.info("Search handlers registered (development features restricted).")

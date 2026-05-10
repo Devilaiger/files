@@ -24,27 +24,87 @@ logger = logging.getLogger(__name__)
 
 # ── Admin check ────────────────────────────────────────────────────────────────
 
-async def is_admin(event) -> bool:
-    """
-    Return True if the event sender is an authorised admin.
+# ── Admin check ────────────────────────────────────────────────────────────────
 
-    Priority:
-      1. Sender ID is in ADMIN_IDS (config).
-      2. Sender is creator / admin of the current group/channel.
+async def is_user_admin(event, chat_id: int = None) -> bool:
+    """
+    Check if the sender is a Telegram admin/creator in the chat.
+    Handles Anonymous Admins (where sender_id == chat_id).
+    """
+    target_chat_id = chat_id or event.chat_id
+    sender_id = event.sender_id
+
+    if not target_chat_id:
+        logger.info("Admin check denied: No target_chat_id found.")
+        return False
+
+    # If it's a private chat (user ID), we can't be a "Telegram admin" in the group sense
+    # unless target_chat_id is explicitly a group ID.
+    if event.is_private and chat_id is None:
+        return False
+
+    # Anonymous Admin check (only if target is a group/channel)
+    if sender_id == target_chat_id:
+        logger.info(f"Admin check granted: User {sender_id} is Anonymous Admin of {target_chat_id}")
+        return True
+
+    try:
+        # Check Telegram permissions
+        perms = await event.client.get_permissions(target_chat_id, sender_id)
+        is_adm = perms.is_admin or perms.is_creator
+        if is_adm:
+            logger.info(f"Admin check granted: User {sender_id} is Telegram admin/creator of {target_chat_id}")
+        return is_adm
+    except Exception as e:
+        logger.debug(f"is_user_admin check failed for {sender_id} in {target_chat_id}: {e}")
+        return False
+
+
+async def is_admin(event, chat_id: int = None) -> bool:
+    """
+    Return True if the event sender is an authorised admin for the target chat.
+    If chat_id is not provided, defaults to event.chat_id.
+
+    Plan B Hierarchy:
+      1. Authorized Bot Administrator: config.ADMIN_IDS
+      2. Adder: The user who invited the bot (db.get_group_adder)
+      3. Bot Admin: Users explicitly added via /add_bot_admin (db.get_group_authority)
+      4. Telegram Admin: Standard group admins, unless explicitly banned.
     """
     sender_id = event.sender_id
     if sender_id in config.ADMIN_IDS:
+        logger.info(f"Admin check granted: User {sender_id} is an Authorized Bot Administrator.")
         return True
 
-    # Fallback: group/channel admin check
-    if hasattr(event, "is_group") and (event.is_group or getattr(event, "is_channel", False)):
-        try:
-            perms = await event.client.get_permissions(event.chat_id, sender_id)
-            return perms.is_admin or perms.is_creator
-        except Exception:
-            pass
+    target_chat_id = chat_id or event.chat_id
+    if not target_chat_id:
+        logger.info("Admin check denied: No target_chat_id for authorization.")
+        return False
 
-    return False
+    # If we are in a PM and no specific group was targetted, standard user is not admin.
+    if event.is_private and chat_id is None:
+        return False
+
+    import db  # Local import to avoid circularity
+
+    # 1. Check if user is the Adder
+    adder_id = await db.get_group_adder(target_chat_id)
+    if sender_id == adder_id:
+        logger.info(f"Admin check granted: User {sender_id} is the Adder of {target_chat_id}")
+        return True
+
+    # 2. Check if user is in allowed_ids or banned_ids
+    auth = await db.get_group_authority(target_chat_id)
+    if auth:
+        if sender_id in auth.get("allowed_ids", []):
+            logger.info(f"Admin check granted: User {sender_id} is an authorized Bot Admin for {target_chat_id}")
+            return True
+        if sender_id in auth.get("banned_ids", []):
+            logger.info(f"Admin check denied: User {sender_id} is explicitly banned in {target_chat_id}")
+            return False
+
+    # 3. Fallback: Standard Telegram Admin check
+    return await is_user_admin(event, chat_id=target_chat_id)
 
 
 # ── Text normalisation ─────────────────────────────────────────────────────────
@@ -196,6 +256,19 @@ def build_trigger_list_text(
     lines = [f"🔑 **Triggers** — Page {page + 1}/{total_pages}\n"]
     for i, t in enumerate(page_items, start=offset + 1):
         trigger_text = t["trigger"]
-        lines.append(f"`{i}.` {trigger_text}")
+        created_by = t.get("created_by_name") or "System"
+        lines.append(f"`{i}.` {trigger_text} (by {created_by})")
 
     return "\n".join(lines), total_pages, page
+
+
+async def get_bot_permissions(client, chat_id: int):
+    """
+    Check if the bot has admin rights and specific permissions in the chat.
+    Returns a permissions object or None if not an admin.
+    """
+    try:
+        me = await client.get_me()
+        return await client.get_permissions(chat_id, me)
+    except Exception:
+        return None
