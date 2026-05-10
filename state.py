@@ -191,6 +191,12 @@ def load() -> None:
         logger.warning("state.json is corrupted (JSONDecodeError: %s) — starting fresh.", e)
     except Exception as e:
         logger.warning("State load failed: %s — starting fresh.", e)
+    finally:
+        # Clean up the file after reading to save space and remove stale data
+        try:
+            _STATE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ── Background save task ───────────────────────────────────────────────────────
